@@ -1,0 +1,272 @@
+//#stock-service/app.js
+
+// Задание:
+// Нужно реализовать 2 сервиса. Один сервис остатков товаров в магазине. У товара могут быть следующие поля:
+// - PLU (артикул товара)
+// - Название товара
+// - Количество товара на полке
+// - Количество товара в заказе
+// - Для какого магазина данных остаток
+// Данные денормализованы, их нужно привести к 2-3 нормальной форме.
+// Должны быть следующие endpoint:
+// - Создание товара
+// - Создание остатка
+// - Увеличение остатка
+// - Уменьшение остатка
+// - Получение остатков по фильтрам (фильтр может быть один, несколько или все)
+// -- plu
+// -- shop_id
+// -- количество остатков на полке (с-по)
+// -- количество остатков в заказе (с-по)
+// - Получение товаров по фильтрам (фильр может быть один, несколько или все)
+// -- name
+// -- plu
+// Другой сервис истории действий с товарами.
+// В сервис “истории действий с товарами” нужно отправлять все события, которые происходят с товарами или остатками (соответственно добавление продукта, создание остатка, увеличение/уменьшение остатка, учитывая, что у добавления продукта нет shop_id, а у остатков он есть). Общение сервисов может происходить любым способом.
+// Этот сервис не использует БД, а хранит все данные в памяти.
+// Сервис “истории действий с товарами или остатками” должен иметь endpoint, который отдаст историю действий с фильтрами по (фильр может быть один, несколько или все):
+// - shop_id
+// - plu
+// - date (с-по)
+// - action
+// и постраничной навигацией. Фреймворк так же может быть любой, но не nest. Один из сервисов должен быть на JS, для второго можно использовать TS. СУБД - postgresql
+
+// всё делаем в одном скрипте, потом разнесём по папкам и файлам.
+import express from 'express';
+import bodyParser from 'body-parser';
+import { v4 as uuidv4 } from 'uuid';
+import { Pool, Client } from 'pg';
+
+const app = express();
+const port = 3000;
+
+const client = new Client({
+    user: 'postgres',
+    host: 'localhost',
+    database: 'postgres',
+    password: 'postgres',
+    port: 5432,
+});
+
+app.use(bodyParser.json());
+
+// функция проверки данных в запросах на корректность и типы (с учётом того, что запросы по фильтрам могут приходить не со всеми полями)
+const operations = {
+    createProduct: ['name', 'plu'],
+    createStock: ['plu', 'shop_id', 'shelf', 'order'],
+    increaseStock: ['plu', 'shop_id', 'shelf', 'order'],
+    decreaseStock: ['plu', 'shop_id', 'shelf', 'order'],
+    getStocks: ['plu', 'shop_id', 'shelfFrom', 'shelfTo', 'orderFrom', 'orderTo'],
+    getProducts: ['name', 'plu'],
+    getActions: ['shop_id', 'plu', 'dateFrom', 'dateTo', 'action', 'page', 'limit'],
+    addAction: ['shop_id', 'plu', 'date', 'action']
+};
+
+const field_types = {
+    name: 'string',
+    plu: 'string',
+    shop_id: 'string',
+    shelf: 'number',
+    order: 'number',
+    shelfFrom: 'number',
+    shelfTo: 'number',
+    orderFrom: 'number',
+    orderTo: 'number',
+    date: 'string',
+    dateFrom: 'string',
+    dateTo: 'string',
+    action: 'string',
+    page: 'number',
+    limit: 'number'
+};
+
+const checkData = (operation, data) => {
+    if (!data || !operation) return false;
+    const fields = operations[operation];
+    if (!fields) return false;
+    for (let field of fields) {
+        if (data[field] !== undefined && typeof data[field] !== field_types[field]) return false;
+    }
+    return true;
+}
+
+// в данную переменную будем складывать историю действий - все события, которые происходят с товарами или остатками (соответственно добавление продукта, создание остатка, увеличение/уменьшение остатка, учитывая, что у добавления продукта нет shop_id, а у остатков он есть)
+// добавляем в истории, только при успешном действии
+const history_actions = []
+
+// создание товара
+app.post('/createProduct', async (req, res) => {
+    const {name, plu} = req.body;
+    if (!checkData('createProduct', req.body)) {
+        res.status(400).send('Bad request');
+        return;
+    }
+    await client.connect();
+    const query = `INSERT INTO products (name, plu) VALUES ('${name}', '${plu}') RETURNING *`;
+    const {rows} = await client.query(query);
+    // если не было ошибки при добавлении, тогда отправляем в history_actions и возвращаем ответ на post-запрос, если была ошибка, то возвращаем ошибку
+    await client.end();
+    if (rows[0]) {
+        history_actions.push({id: uuidv4(), shop_id: null, plu, date: new Date().toISOString(), action: 'createProduct'});
+        res.json(rows[0]);
+    } else {
+        res.status(400).send('Bad request');
+    }
+});
+
+// создание остатка
+app.post('/createStock', async (req, res) => {
+    const {plu, shop_id, shelf, order} = req.body;
+    if (!checkData('createStock', req.body)) {
+        res.status(400).send('Bad request');
+        return;
+    }
+    await client.connect();
+    const query = `INSERT INTO stocks (plu, shop_id, shelf, order) VALUES ('${plu}', '${shop_id}', '${shelf}', '${order}') RETURNING *`;
+    const {rows} = await client.query(query);
+    await client.end();
+    if (rows[0]) {
+        history_actions.push({id: uuidv4(), shop_id, plu, date: new Date().toISOString(), action: 'createStock'});
+        res.json(rows[0]);
+    } else {
+        res.status(400).send('Bad request');
+    }
+});
+
+// увеличение остатка
+app.put('/increaseStock', async (req, res) => {
+    const {plu, shop_id, shelf, order} = req.body;
+    if (!checkData('increaseStock', req.body)) {
+        res.status(400).send('Bad request');
+        return;
+    }
+    await client.connect();
+    const query = `UPDATE stocks SET shelf = shelf + ${shelf}, order = order + ${order} WHERE plu = '${plu}' AND shop_id = '${shop_id}' RETURNING *`;
+    const {rows} = await client.query(query);
+    await client.end();
+    if (rows[0]) {
+        history_actions.push({id: uuidv4(), shop_id, plu, date: new Date().toISOString(), action: 'increaseStock'});
+        res.json(rows[0]);
+    } else {
+        res.status(400).send('Bad request');
+    }
+});
+
+// уменьшение остатка
+app.put('/decreaseStock', async (req, res) => {
+    const {plu, shop_id, shelf, order} = req.body;
+    if (!checkData('decreaseStock', req.body)) {
+        res.status(400).send('Bad request');
+        return;
+    }
+    await client.connect();
+    const query = `UPDATE stocks SET shelf = shelf - ${shelf}, order = order - ${order} WHERE plu = '${plu}' AND shop_id = '${shop_id}' RETURNING *`;
+    const {rows} = await client.query(query);
+    await client.end();
+    if (rows[0]) {
+        history_actions.push({id: uuidv4(), shop_id, plu, date: new Date().toISOString(), action: 'decreaseStock'});
+        res.json(rows[0]);
+    } else {
+        res.status(400).send('Bad request');
+    }
+});
+
+// получение остатков по фильтрам (учитываем, что фильтр может прийти только с одним полем, может с несколькими или со всеми)
+app.get('/getStocks', async (req, res) => {
+    const filters = req.body;
+    if (!checkData('getStocks', filters)) {
+        res.status(400).send('Bad request');
+        return;
+    }
+
+    let query = 'SELECT * FROM stocks WHERE 1=1';
+    if (filters.plu) query += ` AND plu = '${filters.plu}'`;
+    if (filters.shop_id) query += ` AND shop_id = '${filters.shop_id}'`;
+    if (filters.shelfFrom !== undefined) query += ` AND shelf >= ${filters.shelfFrom}`;
+    if (filters.shelfTo !== undefined) query += ` AND shelf <= ${filters.shelfTo}`;
+    if (filters.orderFrom !== undefined) query += ` AND order >= ${filters.orderFrom}`;
+    if (filters.orderTo !== undefined) query += ` AND order <= ${filters.orderTo}`;
+
+    await client.connect();
+    const {rows} = await client.query(query);
+    await client.end();
+    res.json(rows);
+});
+
+// получение товаров по фильтрам (учитываем, что фильтр может прийти только с одним полем, может с несколькими или со всеми)
+app.get('/getProducts', async (req, res) => {
+    const filters = req.body;
+    if (!checkData('getProducts', filters)) {
+        res.status(400).send('Bad request');
+        return;
+    }
+
+    let query = 'SELECT * FROM products WHERE 1=1';
+    if (filters.name) query += ` AND name = '${filters.name}'`;
+    if (filters.plu) query += ` AND plu = '${filters.plu}'`;
+
+    await client.connect();
+    const {rows} = await client.query(query);
+    await client.end();
+    res.json(rows);
+});
+
+// endpoint, который отдаст историю действий с фильтрами по:
+// - shop_id
+// - plu
+// - date (с-по)
+// - action
+// и постраничной навигацией
+app.get('/getActions', async (req, res) => {
+    const filters = req.body;
+    if (!checkData('getActions', filters)) {
+        res.status(400).send('Bad request');
+        return;
+    }
+
+    // let query = 'SELECT * FROM actions WHERE 1=1';
+    // if (filters.shop_id) query += ` AND shop_id = '${filters.shop_id}'`;
+    // if (filters.plu) query += ` AND plu = '${filters.plu}'`;
+    // if (filters.dateFrom) query += ` AND date >= '${filters.dateFrom}'`;
+    // if (filters.dateTo) query += ` AND date <= '${filters.dateTo}'`;
+    // if (filters.action) query += ` AND action = '${filters.action}'`;
+    //
+    // await client.connect();
+    // const {rows} = await client.query(query);
+    // await client.end();
+
+    // вместо запроса к БД, просто фильтруем историю действий
+    let rows = history_actions;
+    if (filters.shop_id) rows = rows.filter(row => row.shop_id === filters.shop_id);
+    if (filters.plu) rows = rows.filter(row => row.plu === filters.plu);
+    if (filters.dateFrom) rows = rows.filter(row => row.date >= filters.dateFrom);
+    if (filters.dateTo) rows = rows.filter(row => row.date <= filters.dateTo);
+    if (filters.action) rows = rows.filter(row => row.action === filters.action);
+    //if (filters.page && filters.limit) rows = rows.slice((filters.page - 1) * filters.limit, filters.page * filters.limit);
+    let page = filters.page || 1;
+    let limit = filters.limit || 20;
+    let offset = (page - 1) * limit;
+    rows = rows.slice(offset, offset + limit);
+    res.json(rows);
+});
+
+// добавление действия в историю
+app.post('/addAction', async (req, res) => {
+    const {shop_id, plu, date, action} = req.body;
+    if (!checkData('addAction', req.body)) {
+        res.status(400).send('Bad request');
+        return;
+    }
+    history_actions.push({id: uuidv4(), shop_id, plu, date, action});
+    res.json({status: 'ok'});
+});
+
+// app.get('/', (req, res) => {
+//
+// });
+
+
+
+app.listen(port, () => {
+  console.log(`Example app listening at http://localhost:${port}`);
+});
